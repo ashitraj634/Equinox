@@ -3,12 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Parkinson's Tremor Monitor - Raw Data Visualizer</title>
+    <title>Parkinson's Tremor Monitor - Dashboard</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- HTMX -->
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script async src="https://unpkg.com/es-module-shims@1.10.0"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script type="importmap">
     {
         "imports": {
@@ -20,75 +22,183 @@
     <style>
         body {
             font-family: 'Inter', sans-serif;
-            background-color: #0f172a; 
-            color: #f8fafc; 
             overflow: hidden; 
-        }
-        #canvas-container {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100vw;
-            height: 100vh;
-            z-index: 0;
         }
         .data-card {
             background-color: rgba(30, 41, 59, 0.7); 
             border: 1px solid rgba(148, 163, 184, 0.2); 
             backdrop-filter: blur(12px);
-            z-index: 10;
+        }
+        
+        /* Make chart containers responsive */
+        .chart-container {
+            position: relative;
+            height: calc(50vh - 8rem);
+            width: 100%;
         }
     </style>
     <link href="https://fonts.googleapis.com/css?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
-<body class="antialiased">
+<body class="bg-slate-900 text-slate-50 antialiased flex h-screen w-screen">
     <!-- Invisible div triggers HTMX request to fetch updated data -->
     <div hx-get="/data" hx-trigger="every 50ms" hx-swap="none"></div>
     
-    <!-- 3D Visualization Canvas -->
-    <div id="canvas-container"></div>
+    <!-- LEFT PANEL: 3D Visualization -->
+    <div class="relative w-1/2 h-full shrink-0 border-r border-slate-800" id="left-panel">
+        <div id="canvas-container" class="absolute inset-0 z-0"></div>
 
-    <!-- UI Overlay -->
-    <div class="absolute top-0 left-8 p-4 sm:p-6 lg:p-8 w-full max-w-lg pointer-events-none z-10">
-        <header class="mb-4">
-            <h1 class="text-3xl font-bold tracking-tight text-white drop-shadow-md">Raw Sensor Visualizer</h1>
-            <p class="text-sm font-medium tracking-wide text-sky-400 mt-1 uppercase">Parkinson's Tremor Lab</p>
-        </header>
+        <!-- UI Overlay -->
+        <div class="absolute top-0 left-0 p-8 w-full z-10 pointer-events-none">
+            <header class="mb-4">
+                <h1 class="text-3xl font-bold tracking-tight text-white drop-shadow-md">Sensor Dashboard</h1>
+                <p class="text-sm font-medium tracking-wide text-sky-400 mt-1 uppercase">Parkinson's Tremor Lab</p>
+            </header>
 
-        <!-- Sensor Data Panel -->
-        <div class="data-card rounded-2xl shadow-2xl p-6 pointer-events-auto transition-all duration-300">
-            <div id="data-display" class="animate-pulse text-slate-400 font-medium">
-                Waiting for serial data...
+            <!-- Sensor Data Panel -->
+            <div class="data-card rounded-2xl shadow-2xl p-6 pointer-events-auto transition-all duration-300 w-full max-w-[350px]">
+                <div id="data-display" class="animate-pulse text-slate-400 font-medium">
+                    Waiting for serial data...
+                </div>
+            </div>
+
+            <!-- DSP Analytics Panel -->
+            <div class="data-card mt-4 rounded-2xl shadow-2xl p-6 pointer-events-auto transition-all duration-300 w-full max-w-[350px]">
+                <div id="dsp-display" class="animate-pulse text-slate-400 font-medium">
+                    Buffering DSP Window...
+                </div>
             </div>
         </div>
     </div>
 
-    <!-- JS Logic -->
+    <!-- RIGHT PANEL: Real-time Charts -->
+    <div class="w-1/2 h-full flex flex-col p-6 gap-6 bg-slate-900 z-10 overflow-hidden" id="right-panel">
+        
+        <!-- Accelerometer Chart Tile -->
+        <div class="data-card flex-1 rounded-2xl shadow-xl p-4 flex flex-col">
+            <div class="flex justify-between items-center mb-2">
+                <h2 class="font-bold text-emerald-400">Accelerometer</h2>
+                <span class="text-xs bg-emerald-400/10 text-emerald-300 px-2 py-1 rounded">Units: g</span>
+            </div>
+            <div class="chart-container flex-1">
+                <canvas id="accelChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Gyroscope Chart Tile -->
+        <div class="data-card flex-1 rounded-2xl shadow-xl p-4 flex flex-col">
+            <div class="flex justify-between items-center mb-2">
+                <h2 class="font-bold text-purple-400">Gyroscope</h2>
+                <span class="text-xs bg-purple-400/10 text-purple-300 px-2 py-1 rounded">Units: &deg;/s</span>
+            </div>
+            <div class="chart-container flex-1">
+                <canvas id="gyroChart"></canvas>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- JS Logic: ThreeJS and ChartJS -->
     <script type="module">
         import * as THREE from 'three';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
+        // --- Chart.js Setup ---
+        const maxPoints = 100; // Roughly 5 seconds of data at 50ms intervals
+        const createEmptyArray = () => Array(maxPoints).fill(0);
+        const blankLabels = Array(maxPoints).fill('');
+
+        const gridColor = 'rgba(51, 65, 85, 0.5)';
+        const textColor = '#94a3b8';
+
+        const chartOptions = {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false, // Turn off animation for performance on high-frequency streaming
+            interaction: { mode: 'index', intersect: false },
+            scales: {
+                x: { 
+                    display: false 
+                },
+                y: { 
+                    grid: { color: gridColor },
+                    ticks: { color: textColor, font: { family: 'Inter' } }
+                }
+            },
+            plugins: {
+                legend: { 
+                    labels: { color: '#f8fafc', font: { family: 'Inter', weight: '500' }, usePointStyle: true, boxWidth: 8 } 
+                },
+                tooltip: { enabled: false }
+            },
+            elements: {
+                line: { tension: 0.2, borderWidth: 2 },
+                point: { radius: 0 } // completely hide points to render faster
+            }
+        };
+
+        const accelCtx = document.getElementById('accelChart').getContext('2d');
+        const gyroCtx = document.getElementById('gyroChart').getContext('2d');
+
+        window.accelChart = new Chart(accelCtx, {
+            type: 'line',
+            data: {
+                labels: blankLabels,
+                datasets: [
+                    { label: 'X', borderColor: '#ef4444', data: createEmptyArray() }, // Red
+                    { label: 'Y', borderColor: '#22c55e', data: createEmptyArray() }, // Green
+                    { label: 'Z', borderColor: '#3b82f6', data: createEmptyArray() }  // Blue
+                ]
+            },
+            options: {
+                ...chartOptions,
+                scales: {
+                    ...chartOptions.scales,
+                    y: { ...chartOptions.scales.y, suggestedMin: -2, suggestedMax: 2 }
+                }
+            }
+        });
+
+        window.gyroChart = new Chart(gyroCtx, {
+            type: 'line',
+            data: {
+                labels: blankLabels,
+                datasets: [
+                    { label: 'X', borderColor: '#ef4444', data: createEmptyArray() },
+                    { label: 'Y', borderColor: '#22c55e', data: createEmptyArray() },
+                    { label: 'Z', borderColor: '#3b82f6', data: createEmptyArray() }
+                ]
+            },
+            options: {
+                ...chartOptions,
+                scales: {
+                    ...chartOptions.scales,
+                    y: { ...chartOptions.scales.y, suggestedMin: -250, suggestedMax: 250 }
+                }
+            }
+        });
+
+
+        // --- Three.js Setup ---
         let scene, camera, renderer, cube, controls;
         const dataDisplay = document.getElementById('data-display');
+        const leftPanel = document.getElementById('left-panel');
         const canvasContainer = document.getElementById('canvas-container');
 
-        function init() {
+        function init3D() {
             scene = new THREE.Scene();
-            // Match tailwind background
-            scene.background = new THREE.Color(0x0f172a);
+            scene.background = new THREE.Color(0x0f172a); // match bg-slate-900
 
-            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            // The camera aspect ratio is based on the left panel, not the whole window
+            camera = new THREE.PerspectiveCamera(60, leftPanel.clientWidth / leftPanel.clientHeight, 0.1, 1000);
             camera.position.set(2.5, 3.5, 4.5);
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // optimize performance
-            // Soft shadows
+            renderer.setSize(leftPanel.clientWidth, leftPanel.clientHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
             renderer.shadowMap.enabled = true;
             renderer.shadowMap.type = THREE.PCFSoftShadowMap;
             canvasContainer.appendChild(renderer.domElement);
 
-            // Lighting setup for a dynamic, premium look
             const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
             scene.add(ambientLight);
 
@@ -103,7 +213,6 @@
             pointLight.position.set(-2, 2, -2);
             scene.add(pointLight);
 
-            // The Sensor Cube model
             const geometry = new THREE.BoxGeometry(2, 0.2, 3);
             const material = new THREE.MeshStandardMaterial({
                 color: 0x38bdf8, 
@@ -116,110 +225,169 @@
             cube.receiveShadow = true;
             scene.add(cube);
             
-            // Add xyz axes to see orientation visually
             const axesHelper = new THREE.AxesHelper(3);
             cube.add(axesHelper);
 
-            // Ground grid to visualize space
             const gridHelper = new THREE.GridHelper(20, 20, 0x334155, 0x1e293b);
             gridHelper.position.y = -1.5;
             scene.add(gridHelper);
 
-            // Controls
             controls = new OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
             controls.dampingFactor = 0.05;
             
             window.addEventListener('resize', onWindowResize, false);
-            animate();
+            animate3D();
         }
 
         function onWindowResize() {
-            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.aspect = leftPanel.clientWidth / leftPanel.clientHeight;
             camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setSize(leftPanel.clientWidth, leftPanel.clientHeight);
         }
 
-        function animate() {
-            requestAnimationFrame(animate);
-            controls.update(); // needed for damping
+        function animate3D() {
+            requestAnimationFrame(animate3D);
+            controls.update(); 
             renderer.render(scene, camera);
         }
 
+        init3D();
+
+        // --- HTMX Data Receiver ---
         document.body.addEventListener('htmx:afterOnLoad', function(event) {
             if (event.detail.pathInfo.requestPath === '/data') {
                 try {
                     const data = JSON.parse(event.detail.xhr.responseText);
                     
-                    if (cube && data.raw_ax !== undefined) {
-                        // Apply rotation based on the Python Complementary Filter results
-                        const pitchRad = THREE.MathUtils.degToRad(data.pitch);
-                        const rollRad = THREE.MathUtils.degToRad(data.roll);
-                        const yawRad = THREE.MathUtils.degToRad(data.yaw);
+                    if (data.raw_ax !== undefined) {
                         
-                        // Three.js uses XYZ order normally, but sensor axes mapping might need tuning 
-                        // based on physical chip orientation. Adjust order if it misbehaves.
-                        cube.rotation.set(pitchRad, yawRad, rollRad, 'XYZ');
-                    }
+                        // 1. Update 3JS Rotation
+                        if (cube) {
+                            const pitchRad = THREE.MathUtils.degToRad(data.pitch);
+                            const rollRad = THREE.MathUtils.degToRad(data.roll);
+                            const yawRad = THREE.MathUtils.degToRad(data.yaw);
+                            cube.rotation.set(pitchRad, yawRad, rollRad, 'XYZ');
+                        }
 
-                    if (dataDisplay && data.raw_ax !== undefined) {
-                        dataDisplay.classList.remove('animate-pulse');
-                        dataDisplay.innerHTML = `
-                            <div class="flex flex-col gap-5 font-mono text-sm">
-                                <div>
-                                    <h3 class="font-bold text-sky-400 mb-2 border-b border-sky-400/20 pb-1 flex items-center justify-between">
-                                        Estimated Angle
-                                        <span class="text-xs font-normal text-slate-500 font-sans">Filtered Fusion</span>
-                                    </h3>
-                                    <div class="grid grid-cols-3 gap-2 text-slate-300">
-                                        <div class="bg-slate-800/50 rounded p-2 text-center border border-slate-700/50">
-                                            <div class="text-[0.65rem] uppercase tracking-wider text-slate-400 mb-1">Pitch</div>
-                                            <div class="font-semibold">${data.pitch.toFixed(1)}&deg;</div>
-                                        </div>
-                                        <div class="bg-slate-800/50 rounded p-2 text-center border border-slate-700/50">
-                                            <div class="text-[0.65rem] uppercase tracking-wider text-slate-400 mb-1">Roll</div>
-                                            <div class="font-semibold">${data.roll.toFixed(1)}&deg;</div>
-                                        </div>
-                                        <div class="bg-slate-800/50 rounded p-2 text-center border border-slate-700/50">
-                                            <div class="text-[0.65rem] uppercase tracking-wider text-slate-400 mb-1">Yaw</div>
-                                            <div class="font-semibold">${data.yaw.toFixed(1)}&deg;</div>
-                                        </div>
-                                    </div>
-                                </div>
-                                
-                                <div>
-                                    <h3 class="font-bold text-emerald-400 mb-2 border-b border-emerald-400/20 pb-1 flex items-center justify-between">
-                                        Raw Accel (I2C)
-                                        <span class="text-xs font-normal text-slate-500 font-sans">LSB</span>
-                                    </h3>
-                                    <div class="grid grid-cols-3 gap-2 text-slate-300">
-                                        <div class="flex justify-between items-center"><span class="text-slate-500">X:</span><span>${data.raw_ax}</span></div>
-                                        <div class="flex justify-between items-center"><span class="text-slate-500">Y:</span><span>${data.raw_ay}</span></div>
-                                        <div class="flex justify-between items-center"><span class="text-slate-500">Z:</span><span>${data.raw_az}</span></div>
-                                    </div>
-                                </div>
+                        // 2. Update Charts 
+                        // Accel Chart
+                        window.accelChart.data.datasets[0].data.push(data.ax_g);
+                        window.accelChart.data.datasets[1].data.push(data.ay_g);
+                        window.accelChart.data.datasets[2].data.push(data.az_g);
+                        
+                        window.accelChart.data.datasets[0].data.shift();
+                        window.accelChart.data.datasets[1].data.shift();
+                        window.accelChart.data.datasets[2].data.shift();
+                        window.accelChart.update();
 
-                                <div>
-                                    <h3 class="font-bold text-purple-400 mb-2 border-b border-purple-400/20 pb-1 flex items-center justify-between">
-                                        Raw Gyro (I2C)
-                                        <span class="text-xs font-normal text-slate-500 font-sans">LSB</span>
-                                    </h3>
-                                    <div class="grid grid-cols-3 gap-2 text-slate-300">
-                                        <div class="flex justify-between items-center"><span class="text-slate-500">X:</span><span>${data.raw_gx}</span></div>
-                                        <div class="flex justify-between items-center"><span class="text-slate-500">Y:</span><span>${data.raw_gy}</span></div>
-                                        <div class="flex justify-between items-center"><span class="text-slate-500">Z:</span><span>${data.raw_gz}</span></div>
+                        // Gyro Chart
+                        window.gyroChart.data.datasets[0].data.push(data.gx_dps);
+                        window.gyroChart.data.datasets[1].data.push(data.gy_dps);
+                        window.gyroChart.data.datasets[2].data.push(data.gz_dps);
+                        
+                        window.gyroChart.data.datasets[0].data.shift();
+                        window.gyroChart.data.datasets[1].data.shift();
+                        window.gyroChart.data.datasets[2].data.shift();
+                        window.gyroChart.update();
+
+                        // 3. Update Text Display
+                        if (dataDisplay) {
+                            dataDisplay.classList.remove('animate-pulse');
+                            dataDisplay.innerHTML = `
+                                <div class="flex flex-col gap-5 font-mono text-xs">
+                                    <div>
+                                        <h3 class="font-bold text-sky-400 mb-2 border-b border-sky-400/20 pb-1 flex justify-between">
+                                            Fusion Angle <span class="text-slate-500 font-sans font-normal">&deg;</span>
+                                        </h3>
+                                        <div class="grid grid-cols-3 gap-2 text-slate-300">
+                                            <div class="bg-slate-800/50 rounded p-1 text-center border border-slate-700/50">
+                                                <div class="text-[0.6rem] text-slate-400">PITCH</div>
+                                                <div class="font-semibold">${data.pitch.toFixed(1)}</div>
+                                            </div>
+                                            <div class="bg-slate-800/50 rounded p-1 text-center border border-slate-700/50">
+                                                <div class="text-[0.6rem] text-slate-400">ROLL</div>
+                                                <div class="font-semibold">${data.roll.toFixed(1)}</div>
+                                            </div>
+                                            <div class="bg-slate-800/50 rounded p-1 text-center border border-slate-700/50">
+                                                <div class="text-[0.6rem] text-slate-400">YAW</div>
+                                                <div class="font-semibold">${data.yaw.toFixed(1)}</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <div>
+                                        <h3 class="font-bold text-emerald-400 mb-2 border-b border-emerald-400/20 pb-1 flex justify-between">
+                                            Physical Accel <span class="text-slate-500 font-sans font-normal">g</span>
+                                        </h3>
+                                        <div class="grid grid-cols-3 gap-2 text-slate-300">
+                                            <div class="flex justify-between"><span>X:</span><span>${data.ax_g.toFixed(2)}</span></div>
+                                            <div class="flex justify-between"><span>Y:</span><span>${data.ay_g.toFixed(2)}</span></div>
+                                            <div class="flex justify-between"><span>Z:</span><span>${data.az_g.toFixed(2)}</span></div>
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <h3 class="font-bold text-purple-400 mb-2 border-b border-purple-400/20 pb-1 flex justify-between">
+                                            Physical Gyro <span class="text-slate-500 font-sans font-normal">&deg;/s</span>
+                                        </h3>
+                                        <div class="grid grid-cols-3 gap-2 text-slate-300">
+                                            <div class="flex justify-between"><span>X:</span><span>${data.gx_dps.toFixed(0)}</span></div>
+                                            <div class="flex justify-between"><span>Y:</span><span>${data.gy_dps.toFixed(0)}</span></div>
+                                            <div class="flex justify-between"><span>Z:</span><span>${data.gz_dps.toFixed(0)}</span></div>
+                                        </div>
                                     </div>
                                 </div>
-                            </div>
-                        `;
+                            `;
+                        }
+
+                        // 4. Update DSP Display
+                        const dspDisplay = document.getElementById('dsp-display');
+                        if (dspDisplay && data.dsp_axis !== undefined) {
+                            dspDisplay.classList.remove('animate-pulse');
+                            
+                            let dspContent = '';
+                            if (data.dsp_freq > 0) {
+                                dspContent = `
+                                    <h3 class="font-bold text-amber-400 mb-2 border-b border-amber-400/20 pb-1 flex justify-between">
+                                        Tremor Detected <span class="text-slate-500 font-sans font-normal border border-slate-600 rounded px-1">FFT</span>
+                                    </h3>
+                                    <div class="grid grid-cols-2 gap-4 text-slate-300 mt-3">
+                                        <div class="bg-amber-900/40 rounded p-2 text-center border border-amber-700/50">
+                                            <div class="text-[0.65rem] text-amber-200/70 mb-1 tracking-wider uppercase">Dominant Freq</div>
+                                            <div class="font-bold text-xl text-amber-400">${data.dsp_freq.toFixed(1)} <span class="text-sm font-normal">Hz</span></div>
+                                        </div>
+                                        <div class="bg-amber-900/40 rounded p-2 text-center border border-amber-700/50">
+                                            <div class="text-[0.65rem] text-amber-200/70 mb-1 tracking-wider uppercase">Dominant Axis</div>
+                                            <div class="font-bold text-xl text-amber-400">${data.dsp_axis}</div>
+                                        </div>
+                                    </div>
+                                    <div class="mt-3 text-center text-xs text-slate-400">
+                                        Normalized Energy: ${data.dsp_amp.toFixed(3)} g
+                                    </div>
+                                `;
+                            } else {
+                                dspContent = `
+                                    <h3 class="font-bold text-slate-400 mb-2 border-b border-slate-600/50 pb-1 flex justify-between">
+                                        Tremor Status <span class="text-slate-500 font-sans font-normal border border-slate-600 rounded px-1">FFT</span>
+                                    </h3>
+                                    <div class="flex items-center justify-center p-4">
+                                        <div class="text-sm text-slate-500 flex items-center gap-2">
+                                            <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
+                                            Monitoring 3-12 Hz Band...
+                                        </div>
+                                    </div>
+                                `;
+                            }
+                            dspDisplay.innerHTML = dspContent;
+                        }
+
                     }
                 } catch (e) {
-                    // Suppress parse errors quietly if serial buffer got chopped
+                    console.error('Error handling data update', e);
                 }
             }
         });
-
-        init();
     </script>
 </body>
 </html>
