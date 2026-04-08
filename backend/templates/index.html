@@ -385,12 +385,32 @@
                         // 5. Active Learning Trigger
                         if (data.needs_label) {
                             const modal = document.getElementById('label-modal');
-                            if (modal) {
+                            if (modal && modal.classList.contains('hidden')) {
+                                document.getElementById('episode-duration').innerText = `Duration: ${data.episode_duration.toFixed(1)}s`;
+                                
+                                const modalTitle = document.getElementById('modal-title');
+                                const modalDesc = document.getElementById('modal-desc');
+                                
+                                if (data.compound_signal) {
+                                    modalTitle.innerText = "Complex Motion Detected!";
+                                    modalTitle.className = "text-2xl font-bold text-rose-400 mb-1";
+                                    modalDesc.innerText = "Multiple rhythmic peaks were isolated during this episode. What activities were you doing simultaneously?";
+                                    window.currentLabelPrefix = "Compound_";
+                                } else {
+                                    modalTitle.innerText = "Isolated Rhythm Detected!";
+                                    modalTitle.className = "text-2xl font-bold text-amber-400 mb-1";
+                                    modalDesc.innerText = "A single, clean physiological rhythm concluded. What was this activity?";
+                                    window.currentLabelPrefix = "Isolated_";
+                                }
+
+                                if (window.xaiChart && data.xai_fft_freqs.length > 0) {
+                                    window.xaiChart.data.labels = data.xai_fft_freqs.map(f => f.toFixed(1));
+                                    window.xaiChart.data.datasets[0].data = data.xai_fft_amps;
+                                    window.xaiChart.update();
+                                }
+
                                 modal.classList.remove('hidden');
-                                modal.style.display = 'flex'; // Force display to override any Tailwind hierarchy issues
-                            } else {
-                                // If the UI hasn't reloaded yet and the modal isn't physically in the code, fallback to an alert
-                                alert("Data Logger: Unknown Periodic Signal Detected!\n\n(Note: The physical Modal didn't load. Please press Ctrl+Shift+R or Cmd+Shift+R to hard-refresh the cache.)");
+                                modal.classList.add('flex');
                             }
                         }
 
@@ -402,41 +422,110 @@
         });
     </script>
     <!-- Active Learning Modal -->
-    <div id="label-modal" class="fixed inset-0 bg-slate-900/80 backdrop-blur-sm z-50 hidden flex-col items-center justify-center p-4">
-        <div class="bg-slate-800 border-2 border-indigo-500 rounded-2xl shadow-2xl p-6 max-w-sm w-full text-center slide-up">
-            <div class="w-16 h-16 bg-indigo-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
-                <svg class="w-8 h-8 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+    <div id="label-modal" class="fixed inset-0 bg-slate-900/90 backdrop-blur-md z-50 hidden flex-col items-center justify-center p-4">
+        <div class="bg-slate-800 border-2 border-indigo-500 rounded-2xl shadow-2xl p-6 max-w-lg w-full text-center slide-up">
+            
+            <h2 id="modal-title" class="text-2xl font-bold text-white mb-1">Signal Detected!</h2>
+            <div id="episode-duration" class="text-xs font-mono text-indigo-400 bg-indigo-900/30 inline-block px-2 py-1 rounded mb-4 border border-indigo-500/30">Duration: 0.0s</div>
+            
+            <!-- XAI Chart Area -->
+            <div class="w-full h-40 bg-slate-900 rounded-lg mb-4 border border-slate-700 relative p-2 shadow-inner">
+                <canvas id="xaiCanvas"></canvas>
             </div>
-            <h2 class="text-2xl font-bold text-white mb-2">Signal Detected!</h2>
-            <p class="text-slate-300 text-sm mb-6">The system detected a sustained periodic movement. For the calibration protocol, please label what you were just doing.</p>
+
+            <p id="modal-desc" class="text-slate-300 text-sm mb-6 leading-relaxed">The system detected a sustained periodic movement. For the calibration protocol, please label what you were just doing.</p>
             
             <div class="space-y-3">
-                <button onclick="submitLabel('Tremor')" class="w-full py-3 bg-amber-500 hover:bg-amber-600 text-amber-950 font-bold rounded-lg transition-colors">
-                    It was a Tremor
-                </button>
-                <button onclick="submitLabel('Walking')" class="w-full py-3 bg-emerald-500 hover:bg-emerald-600 text-emerald-950 font-bold rounded-lg transition-colors">
-                    I was Walking
-                </button>
-                <button onclick="submitLabel('Idle')" class="w-full py-3 bg-slate-600 hover:bg-slate-500 text-white font-bold rounded-lg transition-colors">
-                    Other / False Alarm
+                <div class="flex gap-3">
+                    <button onclick="submitLabel('Tremor')" class="flex-1 py-3 bg-amber-500 hover:bg-amber-600 text-amber-950 font-bold rounded-lg transition-colors shadow-lg">
+                        Tremor
+                    </button>
+                    <button onclick="submitLabel('Walking')" class="flex-1 py-3 bg-emerald-500 hover:bg-emerald-600 text-emerald-950 font-bold rounded-lg transition-colors shadow-lg">
+                        Walking
+                    </button>
+                </div>
+                
+                <div class="flex gap-3">
+                    <select id="other-select" class="flex-1 bg-slate-700 text-white rounded-lg px-3 outline-none border border-slate-600 shadow-inner">
+                        <option value="">Presets...</option>
+                        <option value="Running">Running</option>
+                        <option value="Driving">Driving</option>
+                        <option value="Vehicle">Vehicle Ride</option>
+                        <option value="Typing">Typing</option>
+                        <option value="Idle">Idle Noise</option>
+                    </select>
+                    <input type="text" id="custom-input" placeholder="Or type custom..." class="flex-1 bg-slate-700 text-white rounded-lg px-3 py-3 outline-none border border-slate-600 shadow-inner placeholder-slate-400 text-sm">
+                </div>
+                <button onclick="submitOtherLabel()" class="w-full py-3 border-2 border-indigo-500 hover:bg-indigo-600 text-white font-bold rounded-lg transition-colors shadow-lg mt-2">
+                    Save Other / Custom
                 </button>
             </div>
         </div>
     </div>
 
     <script>
+        // Initialize XAI Chart
+        const xaiCtx = document.getElementById('xaiCanvas').getContext('2d');
+        window.xaiChart = new Chart(xaiCtx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'FFT Power',
+                    borderColor: '#f59e0b', // amber
+                    backgroundColor: 'rgba(245, 158, 11, 0.15)',
+                    data: [],
+                    fill: true,
+                    tension: 0.3,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    pointHitRadius: 10
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: { ticks: { color: '#94a3b8', maxTicksLimit: 6 }, title: {display: true, text: 'Frequency (Hz)', color: '#64748b'} },
+                    y: { display: false }
+                },
+                plugins: { legend: { display: false }, tooltip: {mode: 'nearest'} }
+            }
+        });
+
+        function submitOtherLabel() {
+            const sel = document.getElementById('other-select').value;
+            const txt = document.getElementById('custom-input').value.trim();
+            const finalLabel = txt !== "" ? txt : (sel !== "" ? sel : "Unknown");
+            submitLabel(finalLabel);
+        }
+
         function submitLabel(labelName) {
+            const prefix = window.currentLabelPrefix || "";
+            const taggedLabel = prefix + labelName;
+
             fetch('/log_data', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ label: labelName })
+                body: JSON.stringify({ label: taggedLabel })
             }).then(response => response.json())
               .then(data => {
                   console.log(data);
-                  document.getElementById('label-modal').classList.remove('flex');
-                  document.getElementById('label-modal').classList.add('hidden');
+                  const modal = document.getElementById('label-modal');
+                  if (modal) {
+                      modal.classList.remove('flex');
+                      modal.classList.add('hidden');
+                      modal.style.display = ''; // Wipe any lingering inline styles
+                  }
+                  
+                  // Destroy chart data to clean up for the next episode
+                  if(window.xaiChart) {
+                      window.xaiChart.data.labels = [];
+                      window.xaiChart.data.datasets[0].data = [];
+                      window.xaiChart.update();
+                  }
               });
         }
     </script>

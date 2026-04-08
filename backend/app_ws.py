@@ -6,6 +6,7 @@ import threading
 import math
 import numpy as np
 from scipy.fft import rfft, rfftfreq
+from scipy.signal import find_peaks
 from flask import Flask, jsonify, render_template, request
 import websocket  # websocket-client library
 
@@ -22,17 +23,27 @@ os.makedirs(DATASET_DIR, exist_ok=True)
 # --- Thread-Safe Data Storage ---
 sensor_data = {
     'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0,
-    'raw_ax': 0, 'raw_ay': 0, 'raw_az': 0,  
+    'raw_ax': 0, 'raw_ay': 0, 'raw_az': 0,
     'raw_gx': 0, 'raw_gy': 0, 'raw_gz': 0,
     'ax_g': 0.0, 'ay_g': 0.0, 'az_g': 0.0,
     'gx_dps': 0.0, 'gy_dps': 0.0, 'gz_dps': 0.0,
     'dsp_freq': 0.0, 'dsp_amp': 0.0, 'dsp_axis': 'None',
-    'needs_label': False
+    'needs_label': False,
+    'episode_duration': 0.0,
+    'compound_signal': False,
+    'xai_fft_amps': [],
+    'xai_fft_freqs': []
 }
 data_lock = threading.Lock()
 
-# --- Active Learning Labels ---
-pending_label_window = {'x': [], 'y': [], 'z': []}
+# --- Active Learning / Episode Logic ---
+pending_episode_snapshots = []
+episode_active = False
+episode_start_time = 0
+episode_max_intensity = 0.0
+episode_peak_fft = [] 
+episode_peak_freqs = []
+compound_signal_flag = False
 
 # --- DSP Buffers ---
 BUFFER_SIZE = 256
@@ -40,6 +51,9 @@ SAMPLING_RATE = 50.0 # 50 Hz
 buffer_x = []
 buffer_y = []
 buffer_z = []
+buffer_gx = []
+buffer_gy = []
+buffer_gz = []
 
 # --- Temporal Consistency Filter Variables ---
 last_dom_freq = 0.0
@@ -86,9 +100,15 @@ def process_sensor_line(line):
                 buffer_x.pop(0)
                 buffer_y.pop(0)
                 buffer_z.pop(0)
+                buffer_gx.pop(0)
+                buffer_gy.pop(0)
+                buffer_gz.pop(0)
             buffer_x.append(ax_g)
             buffer_y.append(ay_g)
             buffer_z.append(az_g)
+            buffer_gx.append(gx_dps)
+            buffer_gy.append(gy_dps)
+            buffer_gz.append(gz_dps)
 
             with data_lock:
                 sensor_data['pitch'] = pitch
@@ -148,6 +168,8 @@ def websocket_reader():
 def dsp_worker():
     """Runs FFT on the sliding window every 0.5s to find dominant tremor frequencies."""
     global sensor_data, buffer_x, buffer_y, buffer_z
+    global episode_active, episode_max_intensity, episode_peak_fft, episode_peak_freqs, pending_episode_snapshots, compound_signal_flag, episode_start_time
+    global last_dom_freq, freq_streak_count
     
     while True:
         time.sleep(0.5)
@@ -181,26 +203,25 @@ def dsp_worker():
         highest_amp = 0
         dom_freq = 0
         dom_axis = 'None'
+        active_peaks = 0
+        best_band_raw = []
+
+        # Find multiple peaks! Prominence=0.8 effectively ignores noise flutter.
+        for ax_name, band_data in [('X', band_x), ('Y', band_y), ('Z', band_z)]:
+            peaks, properties = find_peaks(band_data, prominence=0.8)
+            
+            if len(peaks) > 0:
+                active_peaks += len(peaks)
+                
+            max_idx = np.argmax(band_data)
+            if band_data[max_idx] > highest_amp:
+                highest_amp = band_data[max_idx]
+                dom_freq = band_freqs[max_idx]
+                dom_axis = ax_name
+                best_band_raw = list(band_data)
+                
+        is_compound = (active_peaks > 1)
         
-        max_x_idx = np.argmax(band_x)
-        if band_x[max_x_idx] > highest_amp:
-            highest_amp = band_x[max_x_idx]
-            dom_freq = band_freqs[max_x_idx]
-            dom_axis = 'X'
-            
-        max_y_idx = np.argmax(band_y)
-        if band_y[max_y_idx] > highest_amp:
-            highest_amp = band_y[max_y_idx]
-            dom_freq = band_freqs[max_y_idx]
-            dom_axis = 'Y'
-            
-        max_z_idx = np.argmax(band_z)
-        if band_z[max_z_idx] > highest_amp:
-            highest_amp = band_z[max_z_idx]
-            dom_freq = band_freqs[max_z_idx]
-            dom_axis = 'Z'
-            
-        global last_dom_freq, freq_streak_count
         STREAK_THRESHOLD = 11 
         
         activity_window = 25
@@ -225,25 +246,55 @@ def dsp_worker():
             last_dom_freq = dom_freq
             
             if freq_streak_count >= STREAK_THRESHOLD:
+                # WE ARE IN AN EPISODE
+                if not episode_active:
+                    episode_active = True
+                    episode_start_time = time.time()
+                    pending_episode_snapshots = []
+                    episode_max_intensity = 0.0
+                    compound_signal_flag = False
+                    print(f"--- EPISODE STARTED! Frequency: {dom_freq:.1f}Hz ---")
+                
+                if is_compound:
+                    compound_signal_flag = True
+                
+                if highest_amp > episode_max_intensity:
+                    episode_max_intensity = highest_amp
+                    episode_peak_fft = list(best_band_raw)
+                    episode_peak_freqs = list(band_freqs)
+                
+                # Take 4 diverse snapshots periodically
+                if len(pending_episode_snapshots) == 0 or (freq_streak_count % 10 == 0 and len(pending_episode_snapshots) < 4):
+                    pending_episode_snapshots.append({
+                        'x': list(buffer_x), 'y': list(buffer_y), 'z': list(buffer_z),
+                        'gx': list(buffer_gx), 'gy': list(buffer_gy), 'gz': list(buffer_gz)
+                    })
+                    print(f"Episode: Saved snapshot #{len(pending_episode_snapshots)}")
+
                 with data_lock:
                     sensor_data['dsp_freq'] = dom_freq
                     sensor_data['dsp_amp'] = highest_amp / (BUFFER_SIZE/2)
                     sensor_data['dsp_axis'] = 'Accel ' + dom_axis
-                    
-                    # TRIGGER ACTIVE LEARNING
-                    if not sensor_data['needs_label'] and freq_streak_count == STREAK_THRESHOLD:
-                        sensor_data['needs_label'] = True
-                        global pending_label_window
-                        pending_label_window['x'] = list(x_data)
-                        pending_label_window['y'] = list(y_data)
-                        pending_label_window['z'] = list(z_data)
-                        print("TRIGGERED ACTIVE LEARNING NOTIFICATION")
             else:
                 with data_lock:
                     sensor_data['dsp_freq'] = 0.0
                     sensor_data['dsp_amp'] = 0.0
                     sensor_data['dsp_axis'] = 'None'
         else:
+            # END OF EPISODE LOGIC
+            if episode_active and freq_streak_count > 0:
+                duration = time.time() - episode_start_time
+                print(f"--- EPISODE ENDED! Duration: {duration:.1f}s. Triggering UI ---")
+                
+                with data_lock:
+                    sensor_data['needs_label'] = True
+                    sensor_data['episode_duration'] = duration
+                    sensor_data['compound_signal'] = compound_signal_flag
+                    sensor_data['xai_fft_amps'] = episode_peak_fft
+                    sensor_data['xai_fft_freqs'] = episode_peak_freqs
+                    
+                episode_active = False
+
             freq_streak_count = 0
             last_dom_freq = 0.0
             with data_lock:
@@ -259,33 +310,35 @@ def index():
 
 @app.route('/log_data', methods=['POST'])
 def log_data():
-    global pending_label_window
+    global pending_episode_snapshots
     data = request.json
     label = data.get('label', 'Unknown')
     
     with data_lock:
         sensor_data['needs_label'] = False # Reset the UI flag
         
-    if not pending_label_window['x']:
+    if not pending_episode_snapshots:
         return jsonify({"status": "error", "message": "No pending data"})
         
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{label}_{timestamp}.csv"
-    filepath = os.path.join(DATASET_DIR, filename)
+    base_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    with open(filepath, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['ax_g', 'ay_g', 'az_g'])
-        for i in range(len(pending_label_window['x'])):
-            writer.writerow([
-                pending_label_window['x'][i],
-                pending_label_window['y'][i],
-                pending_label_window['z'][i]
-            ])
-            
-    pending_label_window = {'x': [], 'y': [], 'z': []}
-    print(f"Data successfully saved to {filepath}")
-    return jsonify({"status": "success", "message": f"Saved {filename}"})
+    for idx, window in enumerate(pending_episode_snapshots):
+        filename = f"{label}_slice{idx+1}_{base_timestamp}.csv"
+        filepath = os.path.join(DATASET_DIR, filename)
+        
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['ax_g', 'ay_g', 'az_g', 'gx_dps', 'gy_dps', 'gz_dps'])
+            for i in range(len(window['x'])):
+                writer.writerow([
+                    window['x'][i], window['y'][i], window['z'][i],
+                    window['gx'][i], window['gy'][i], window['gz'][i]
+                ])
+                
+    saved_count = len(pending_episode_snapshots)
+    pending_episode_snapshots = []
+    print(f"Data successfully saved {saved_count} slices to disk!")
+    return jsonify({"status": "success", "message": f"Saved {saved_count} files"})
 
 @app.route('/data')
 def get_data():
